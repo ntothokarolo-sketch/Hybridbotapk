@@ -1,0 +1,644 @@
+import websocket
+import json
+import threading
+import time
+import logging
+from flask import Flask, render_template_string, request, jsonify
+import uuid
+from datetime import datetime
+import random
+import queue
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# -------------------------
+# Configuration
+# -------------------------
+WS_ENDPOINT = "wss://ws.binaryws.com/websockets/v3"
+RECONNECT_DELAY = 5
+PING_INTERVAL = 15
+MAX_REQUESTS_PER_SECOND = 3
+
+# -------------------------
+# Utility: rate limiter
+# -------------------------
+class RateLimiter:
+    def __init__(self, rate_per_sec: float):
+        self.rate = rate_per_sec
+        self.allowance = rate_per_sec
+        self.last_check = time.time()
+        self.lock = threading.Lock()
+
+    def wait_for_slot(self):
+        while True:
+            with self.lock:
+                current = time.time()
+                time_passed = current - self.last_check
+                self.last_check = current
+                self.allowance += time_passed * self.rate
+                if self.allowance > self.rate:
+                    self.allowance = self.rate
+                if self.allowance >= 1.0:
+                    self.allowance -= 1.0
+                    return
+            time.sleep(0.01)
+
+# -------------------------
+# Core Deriv client
+# -------------------------
+class DerivWebsocketClient:
+    def __init__(self, endpoint: str, token: str, app_id: str = "1089"):
+        self.endpoint = f"{endpoint}?app_id={app_id}"
+        self.token = token
+        self.app_id = app_id
+        self.ws = None
+        self.thread = None
+        self.running = False
+        self.req_id_counter = 0
+        self.pending_req_map = {}
+        self.active_contracts = {}
+        self.rate_limiter = RateLimiter(MAX_REQUESTS_PER_SECOND)
+        self.incoming_queue = queue.Queue()
+        self.connected = False
+        self.authorized = False
+        self.account_id = None
+        self.is_demo = False
+
+    def _next_req_id(self):
+        self.req_id_counter += 1
+        return self.req_id_counter
+
+    def _send(self, payload: dict):
+        self.rate_limiter.wait_for_slot()
+        try:
+            s = json.dumps(payload)
+            logger.debug(">>> %s", s)
+            if self.ws:
+                self.ws.send(s)
+        except Exception as e:
+            logger.exception("Send failed: %s", e)
+
+    def authorize(self):
+        req_id = self._next_req_id()
+        payload = {"authorize": self.token, "req_id": req_id}
+        self.pending_req_map[req_id] = {"type": "authorize", "time": time.time()}
+        self._send(payload)
+
+    def get_balance(self, subscribe: bool = True):
+        req_id = self._next_req_id()
+        payload = {"balance": 1, "subscribe": 1 if subscribe else 0, "req_id": req_id}
+        self.pending_req_map[req_id] = {"type": "balance", "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def get_active_symbols(self):
+        req_id = self._next_req_id()
+        payload = {"active_symbols": "brief", "product_type": "basic", "req_id": req_id}
+        self.pending_req_map[req_id] = {"type": "active_symbols", "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def _on_message(self, ws, message):
+        try:
+            logger.debug("<<< %s", message)
+            data = json.loads(message)
+            self.incoming_queue.put(data)
+        except Exception as e:
+            logger.exception("Failed to parse incoming message: %s", e)
+
+    def _on_open(self, ws):
+        logger.info("WebSocket opened, authorizing...")
+        self.connected = True
+        self.authorize()
+
+    def _on_error(self, ws, error):
+        logger.error("WebSocket error: %s", error)
+        self.connected = False
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        logger.warning("WebSocket closed: %s %s", close_status_code, close_msg)
+        self.connected = False
+        self.running = False
+
+    def _process_incoming(self):
+        while self.running:
+            try:
+                data = self.incoming_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            if "error" in data:
+                logger.error("API error: %s", data.get("error"))
+                continue
+
+            if "authorize" in data:
+                auth = data["authorize"]
+                self.account_id = auth.get("loginid")
+                self.is_demo = auth.get("loginid", "").startswith('VRTC')
+                self.authorized = True
+                logger.info("Authorized. Login id: %s, account_type: %s", self.account_id, auth.get("account_type"))
+                self.get_balance(subscribe=True)
+                self.get_active_symbols()
+                continue
+
+            if "active_symbols" in data:
+                symbols = data["active_symbols"]
+                logger.info("Received %s active symbols", len(symbols))
+                continue
+
+            if "balance" in data:
+                balance_data = data.get("balance", {})
+                logger.info("Balance update: %s", balance_data)
+                continue
+
+            if "msg_type" in data:
+                mt = data["msg_type"]
+                logger.debug("msg_type=%s : %s", mt, data)
+                continue
+
+            logger.debug("Unhandled incoming message: %s", data)
+
+    def _start_keepalive(self):
+        def ping_loop():
+            while self.running:
+                try:
+                    self._send({"ping": 1})
+                except Exception:
+                    logger.exception("Keepalive ping failed")
+                time.sleep(PING_INTERVAL)
+        t = threading.Thread(target=ping_loop, daemon=True)
+        t.start()
+
+    def connect_and_run(self):
+        self.running = True
+        while self.running:
+            try:
+                logger.info("Connecting to %s", self.endpoint)
+                self.ws = websocket.WebSocketApp(self.endpoint,
+                                                 on_open=self._on_open,
+                                                 on_message=self._on_message,
+                                                 on_error=self._on_error,
+                                                 on_close=self._on_close)
+                self.thread = threading.Thread(target=self.ws.run_forever, 
+                                             kwargs={"ping_interval": 0, "ping_timeout": 2}, 
+                                             daemon=True)
+                self.thread.start()
+
+                processor_thread = threading.Thread(target=self._process_incoming, daemon=True)
+                processor_thread.start()
+
+                self._start_keepalive()
+
+                while self.thread.is_alive() and self.running:
+                    time.sleep(1)
+
+            except Exception as e:
+                logger.exception("Connection failed: %s", e)
+
+            if self.running:
+                logger.info("Reconnecting after %s seconds...", RECONNECT_DELAY)
+                time.sleep(RECONNECT_DELAY)
+            else:
+                break
+
+    def stop(self):
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+class DerivHybridTradingBot:
+    def __init__(self):
+        self.ws = None
+        self.connected = False
+        self.authorized = False
+        self.account_id = None
+        self.api_key = None
+        self.app_id = "1089"
+        self.is_demo = True
+        self.tradable_symbols = []
+        self.active_trades = {}
+        self.account_balance = 1000
+        self.account_equity = 1000
+        self.max_drawdown = 0
+        self.max_open_trades = 10
+        self.base_lot_size = 0.01
+        self.auto_lot_adjustment = True
+        self.trade_speed = "ultra"
+        self.selected_symbol = "R_100"
+        self.selected_timeframe = "60"
+        self.trading_enabled = False
+        self.risk_paused = False
+        self.last_trade_time = 0
+        self.trade_count = 0
+        self.profit_loss = 0
+        self.websocket_thread = None
+        self.trading_thread = None
+        
+        # Risk Management
+        self.max_daily_loss = 200
+        self.max_consecutive_losses = 5
+        self.consecutive_losses = 0
+        self.daily_profit_target = 500
+        self.daily_traded_volume = 0
+        self.last_reset_time = datetime.now()
+        
+        # Lot Management
+        self.aggressive_growth = True
+        self.lot_multiplier = 1.0
+        self.min_lot_size = 0.01
+        self.max_lot_size = 20.0
+        self.profit_boost_factor = 2.0
+        
+        # Trading Settings
+        self.trade_cooldown = 0.5
+        self.analysis_speed = 0.1
+        self.max_trades_per_minute = 50
+        
+        # Strategy Parameters
+        self.strategy_params = {
+            'volatility_indices': {
+                'ma_fast': 2, 'ma_slow': 8, 'volatility_period': 6,
+                'momentum_period': 4, 'spike_threshold': 1.2, 'recovery_target': 0.2,
+                'profit_lock': 0.1, 'trailing_stop': 0.08
+            },
+            'boom_crash': {
+                'ma_fast': 1, 'ma_slow': 5, 'volatility_period': 4,
+                'momentum_period': 3, 'spike_threshold': 1.5, 'recovery_target': 0.3,
+                'profit_lock': 0.15, 'trailing_stop': 0.12
+            },
+            'forex': {
+                'ma_fast': 3, 'ma_slow': 10, 'volatility_period': 8,
+                'momentum_period': 6, 'spike_threshold': 0.8, 'recovery_target': 0.15,
+                'profit_lock': 0.08, 'trailing_stop': 0.06
+            }
+        }
+        
+        self.ma_fast = 2
+        self.ma_slow = 8
+        self.volatility_period = 6
+        self.momentum_period = 4
+        self.spike_threshold = 1.2
+        self.recovery_target = 0.2
+        self.profit_lock = 0.1
+        self.trailing_stop = 0.08
+        
+        self.only_close_profitable = True
+        self.let_profits_run = True
+        self.cut_losses_early = False
+        
+        self.trades_per_minute = 0
+        self.last_minute_check = time.time()
+        self.trades_this_minute = 0
+        
+        self.price_data = {}
+        self.current_prices = {}
+        
+        # Deriv Symbols
+        self.deriv_symbols = [
+            {"symbol": "R_10", "name": "Volatility 10 Index", "market": "volatility_indices"},
+            {"symbol": "R_25", "name": "Volatility 25 Index", "market": "volatility_indices"},
+            {"symbol": "R_50", "name": "Volatility 50 Index", "market": "volatility_indices"},
+            {"symbol": "R_75", "name": "Volatility 75 Index", "market": "volatility_indices"},
+            {"symbol": "R_100", "name": "Volatility 100 Index", "market": "volatility_indices"},
+            {"symbol": "R_150", "name": "Volatility 150 Index", "market": "volatility_indices"},
+            {"symbol": "R_200", "name": "Volatility 200 Index", "market": "volatility_indices"},
+            {"symbol": "BOOM1000", "name": "Boom 1000 Index", "market": "boom_crash"},
+            {"symbol": "BOOM500", "name": "Boom 500 Index", "market": "boom_crash"},
+            {"symbol": "BOOM300", "name": "Boom 300 Index", "market": "boom_crash"},
+            {"symbol": "CRASH1000", "name": "Crash 1000 Index", "market": "boom_crash"},
+            {"symbol": "CRASH500", "name": "Crash 500 Index", "market": "boom_crash"},
+            {"symbol": "CRASH300", "name": "Crash 300 Index", "market": "boom_crash"},
+            {"symbol": "frxEURUSD", "name": "EUR/USD", "market": "forex"},
+            {"symbol": "frxGBPUSD", "name": "GBP/USD", "market": "forex"},
+            {"symbol": "frxUSDJPY", "name": "USD/JPY", "market": "forex"}
+        ]
+        
+        # Initialize Deriv client
+        self.deriv_client = None
+    
+    def get_market_type(self, symbol):
+        for deriv_symbol in self.deriv_symbols:
+            if deriv_symbol['symbol'] == symbol:
+                return deriv_symbol['market']
+        return 'volatility_indices'
+    
+    def auto_set_strategy(self, symbol):
+        market_type = self.get_market_type(symbol)
+        
+        if market_type in ['volatility_indices']:
+            params = self.strategy_params['volatility_indices']
+        elif market_type == 'boom_crash':
+            params = self.strategy_params['boom_crash']
+        else:
+            params = self.strategy_params['forex']
+        
+        self.ma_fast = params['ma_fast']
+        self.ma_slow = params['ma_slow']
+        self.volatility_period = params['volatility_period']
+        self.momentum_period = params['momentum_period']
+        self.spike_threshold = params['spike_threshold']
+        self.recovery_target = params['recovery_target']
+        self.profit_lock = params['profit_lock']
+        self.trailing_stop = params['trailing_stop']
+        
+        logger.info(f"Auto-set {market_type} strategy for {symbol}")
+    
+    def calculate_dynamic_lot_size(self):
+        if not self.auto_lot_adjustment:
+            return self.base_lot_size
+        
+        base_balance = 1000
+        balance_growth = self.account_balance / base_balance
+        
+        if self.profit_loss > 0:
+            growth_factor = balance_growth * self.profit_boost_factor
+        else:
+            growth_factor = balance_growth * 0.8
+        
+        calculated_lot = self.base_lot_size * growth_factor * self.lot_multiplier
+        lot_size = max(self.min_lot_size, min(self.max_lot_size, calculated_lot))
+        
+        return round(lot_size, 2)
+    
+    def update_lot_multiplier(self):
+        if self.profit_loss > 100:
+            self.lot_multiplier = min(5.0, self.lot_multiplier + 0.2)
+        elif self.profit_loss < -50:
+            self.lot_multiplier = max(0.3, self.lot_multiplier - 0.1)
+    
+    def connect_to_deriv(self):
+        try:
+            if not self.api_key:
+                logger.error("No API key provided")
+                return False
+                
+            self.deriv_client = DerivWebsocketClient(WS_ENDPOINT, self.api_key, self.app_id)
+            self.deriv_client_thread = threading.Thread(target=self.deriv_client.connect_and_run)
+            self.deriv_client_thread.daemon = True
+            self.deriv_client_thread.start()
+            
+            # Wait for connection
+            for i in range(10):
+                if self.deriv_client and self.deriv_client.connected:
+                    break
+                time.sleep(1)
+            
+            if self.deriv_client and self.deriv_client.connected:
+                self.connected = True
+                logger.info(f"Connected to Deriv API with App ID: {self.app_id}")
+                return True
+            else:
+                logger.error("Failed to connect to Deriv API")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            return False
+    
+    def authorize_account(self):
+        if not self.api_key:
+            logger.error("No API key provided")
+            return
+            
+        if self.deriv_client:
+            self.deriv_client.authorize()
+    
+    def get_balance(self):
+        if self.deriv_client:
+            self.deriv_client.get_balance()
+    
+    def start_trading(self):
+        if not self.authorized:
+            logger.error("Not authorized - cannot start trading")
+            return False
+        
+        self.auto_set_strategy(self.selected_symbol)
+        self.trading_enabled = True
+        
+        self.trading_thread = threading.Thread(target=self.trading_loop)
+        self.trading_thread.daemon = True
+        self.trading_thread.start()
+        
+        logger.info(f"Trading started on {self.selected_symbol}")
+        return True
+    
+    def stop_trading(self):
+        self.trading_enabled = False
+        logger.info("Trading stopped")
+    
+    def trading_loop(self):
+        while self.trading_enabled:
+            try:
+                start_time = time.time()
+                
+                self.check_trading_speed()
+                self.check_risk_management()
+                self.update_account_info()
+                self.update_lot_multiplier()
+                self.monitor_active_trades()
+                self.reset_daily_metrics()
+                
+                # Simulate trading logic
+                if not self.risk_paused and len(self.active_trades) < self.max_open_trades:
+                    self.execute_trade_simulation()
+                
+                elapsed = time.time() - start_time
+                sleep_time = max(0, self.analysis_speed - elapsed)
+                time.sleep(sleep_time)
+                
+            except Exception as e:
+                logger.error(f"Trading loop error: {e}")
+                time.sleep(1)
+    
+    def check_trading_speed(self):
+        current_time = time.time()
+        if current_time - self.last_minute_check >= 60:
+            self.trades_per_minute = self.trades_this_minute
+            self.trades_this_minute = 0
+            self.last_minute_check = current_time
+    
+    def check_risk_management(self):
+        if self.profit_loss <= -self.max_daily_loss:
+            self.risk_paused = True
+            logger.warning(f"Daily loss limit reached: {self.profit_loss}")
+            return
+        
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            self.risk_paused = True
+            logger.warning(f"Max consecutive losses reached: {self.consecutive_losses}")
+            return
+        
+        if self.risk_paused and time.time() - self.last_trade_time > 60:
+            self.risk_paused = False
+            logger.info("Risk pause lifted")
+    
+    def update_account_info(self):
+        self.account_balance = 1000 + self.profit_loss
+        self.account_equity = self.account_balance
+    
+    def monitor_active_trades(self):
+        current_time = time.time()
+        completed_trades = []
+        
+        for contract_id, trade in self.active_trades.items():
+            if trade['status'] == 'open':
+                # Simulate price movement
+                elapsed = current_time - trade['start_time'].timestamp()
+                if elapsed > trade.get('duration', 10):
+                    # Close trade after duration
+                    profit = random.uniform(-2, 5)
+                    self.profit_loss += profit
+                    
+                    if profit < 0:
+                        self.consecutive_losses += 1
+                    else:
+                        self.consecutive_losses = 0
+                    
+                    trade['status'] = 'closed'
+                    trade['profit'] = profit
+                    completed_trades.append(contract_id)
+                    logger.info(f"Trade closed - Contract: {contract_id}")
+        
+        # Remove completed trades
+        for contract_id in completed_trades:
+            del self.active_trades[contract_id]
+    
+    def reset_daily_metrics(self):
+        now = datetime.now()
+        if now.date() > self.last_reset_time.date():
+            self.profit_loss = 0
+            self.consecutive_losses = 0
+            self.daily_traded_volume = 0
+            self.last_reset_time = now
+            logger.info("Daily metrics reset")
+    
+    def execute_trade_simulation(self):
+        current_time = time.time()
+        if current_time - self.last_trade_time < self.trade_cooldown:
+            return
+        
+        # Simulate trade execution
+        contract_id = str(uuid.uuid4())[:8]
+        lot_size = self.calculate_dynamic_lot_size()
+        direction = random.choice(['CALL', 'PUT'])
+        
+        self.active_trades[contract_id] = {
+            'symbol': self.selected_symbol,
+            'transaction_id': contract_id,
+            'start_time': datetime.now(),
+            'buy_price': 100,
+            'payout': lot_size * 0.95,
+            'contract_type': direction,
+            'duration': random.randint(5, 30),
+            'status': 'open',
+            'direction': 'BUY',
+            'lot_size': lot_size,
+            'current_profit': 0
+        }
+        
+        self.trade_count += 1
+        self.trades_this_minute += 1
+        self.daily_traded_volume += lot_size
+        self.last_trade_time = current_time
+        
+        logger.info(f"Trade executed - {direction} on {self.selected_symbol} - Lot: {lot_size}")
+
+# Global bot instance
+bot = DerivHybridTradingBot()
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route("/connect", methods=["POST"])
+def connect():
+    try:
+        data = request.get_json()
+        api_key = data.get("api_key")
+        account_id = data.get("account_id")
+        app_id = data.get("app_id", "1089")
+
+        if not api_key:
+            return jsonify({"status": "error", "message": "Missing API key"})
+
+        bot.api_key = api_key
+        bot.account_id = account_id
+        bot.app_id = app_id
+
+        connected = bot.connect_to_deriv()
+        if connected:
+            bot.authorize_account()
+            return jsonify({"status": "success", "message": "Connected and authorized"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to connect"})
+
+    except Exception as e:
+        logger.exception("Connection error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/start_trading", methods=["POST"])
+def start_trading():
+    try:
+        data = request.get_json()
+        bot.selected_symbol = data.get("symbol", "R_100")
+        bot.base_lot_size = float(data.get("lot_size", 0.01))
+        bot.max_open_trades = int(data.get("max_trades", 10))
+        bot.auto_lot_adjustment = data.get("auto_lot", True)
+
+        started = bot.start_trading()
+        if started:
+            return jsonify({"status": "success", "message": "Trading started"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to start trading"})
+    except Exception as e:
+        logger.exception("Start trading error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/stop_trading", methods=["POST"])
+def stop_trading():
+    try:
+        bot.stop_trading()
+        return jsonify({"status": "success", "message": "Trading stopped"})
+    except Exception as e:
+        logger.exception("Stop trading error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/status", methods=["GET"])
+def status():
+    try:
+        trades = []
+        for contract_id, trade in bot.active_trades.items():
+            trades.append({
+                'contract_id': contract_id,
+                'symbol': trade['symbol'],
+                'direction': trade.get('direction', 'BUY'),
+                'contract_type': trade['contract_type'],
+                'lot_size': trade.get('lot_size', bot.base_lot_size),
+                'profit': trade.get('profit', 0)
+            })
+        
+        return jsonify({
+            "connected": bot.connected,
+            "authorized": bot.authorized,
+            "trading_enabled": bot.trading_enabled,
+            "account_type": "Demo" if bot.is_demo else "Real",
+            "app_id": bot.app_id,
+            "active_trades": len(bot.active_trades),
+            "total_trades": bot.trade_count,
+            "trades": trades
+        })
+    except Exception as e:
+        logger.exception("Status check error")
+        return jsonify({"status": "error", "message": str(e)})
+
+if __name__ == "__main__":
+    print("Deriv Hybrid Auto-Trading Bot Starting...")
+    print("Access the bot at: http://127.0.0.1:5000")
+    app.run(host="0.0.0.0", port=5000, debug=True)
